@@ -83,6 +83,16 @@ base class _NativeRenderTexture extends RenderTexture {
   int _textureId = -1;
   Pointer<Void> _rendererPtr = nullptr;
 
+  /// Set by [_markDestroyed] when the underlying renderer is lost (e.g. the
+  /// app was backgrounded and the platform's Metal/Surface texture was
+  /// released). We keep [_textureId] valid in that case so the Flutter
+  /// compositor keeps painting the last cached frame for that texture id
+  /// instead of going blank for the duration of the async
+  /// `createTexture` round-trip. The next [performLayout] sees this flag
+  /// via [needsResize] and triggers a recreation; [makeRenderTexture]
+  /// clears it eagerly so a concurrent layout doesn't double-fire.
+  bool _needsRecreate = false;
+
   _NativeRenderTexture(this.methodChannel);
 
   @override
@@ -109,7 +119,7 @@ base class _NativeRenderTexture extends RenderTexture {
 
   @override
   bool needsResize(int width, int height) =>
-      width != _width || height != _height;
+      _needsRecreate || width != _width || height != _height;
 
   @override
   bool get isDisposed => _textureId == -1;
@@ -142,6 +152,11 @@ base class _NativeRenderTexture extends RenderTexture {
     // Immediately update cached values in-case we redraw during udpate.
     _width = width;
     _height = height;
+    // Clear eagerly so a concurrent layout pass (e.g. lifecycle resume +
+    // tilt animation) doesn't re-trigger recreation while this one is in
+    // flight. The caller already guards with `_isCreatingTexture`, but
+    // resetting here is cheap insurance.
+    _needsRecreate = false;
     final result = await methodChannel.invokeMethod('createTexture', {
       'width': width == 0 ? 1 : width,
       'height': height == 0 ? 1 : height,
@@ -174,13 +189,23 @@ base class _NativeRenderTexture extends RenderTexture {
 
   void _markDestroyed() {
     _rendererPtr = nullptr;
-    final textureIdToDestroy = _textureId;
-    if (textureIdToDestroy != -1) {
-      _textureId = -1;
-      _allTextures.remove(textureIdToDestroy);
-      _disposeTexture(textureIdToDestroy);
-      _width = _height = 0;
-    }
+    _needsRecreate = true;
+    // We deliberately keep `_textureId` valid here. The platform texture
+    // has been unregistered on the native side (e.g. app backgrounding
+    // released the Surface/Metal texture), but the Flutter compositor
+    // still has the last frame buffered for that id. By NOT setting
+    // `_textureId = -1` we let `paint()` keep adding a TextureLayer with
+    // that id while the async `makeRenderTexture` round-trip runs, so
+    // the user sees a stale-but-correct frame for the 1-3 frames it
+    // takes to recreate, instead of a blank flash. The recreation is
+    // triggered by [needsResize] returning true via [_needsRecreate].
+    // The old texture id is properly disposed inside the next
+    // [makeRenderTexture] once we have a replacement in hand.
+    //
+    // Sizes are reset so the next layout pass sees a definite
+    // "needs to make a texture" state regardless of which signal the
+    // RenderObject ends up checking first.
+    _width = _height = 0;
   }
 
   @override
