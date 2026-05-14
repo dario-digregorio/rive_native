@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/gestures.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart';
@@ -1109,10 +1111,36 @@ abstract class RiveNativeRenderBox extends RiveRenderBox<RenderTexturePainter> {
   void paint(PaintingContext context, Offset offset) {
     if (_markNeedsLayoutCalled) {
       final currentTransformTo = getTransformTo(null);
-      final newWidthScale = currentTransformTo.entry(0, 0).abs();
-      final newHeightScale = currentTransformTo.entry(1, 1).abs();
-      if (newWidthScale != desiredTransformWidthScale ||
-          newHeightScale != desiredTransformHeightScale) {
+      // Extract the per-axis scale as the length of the transformed basis
+      // vectors instead of reading `entry(0, 0)` / `entry(1, 1)` directly.
+      // For a pure rotation matrix (e.g. flutter_tilt's 3D perspective
+      // transform) the basis vector length stays at 1, so we don't
+      // misinterpret `cos(angle)` along the diagonal as a fractional scale
+      // change every animation frame.
+      //
+      // Without this, every Tilt frame would schedule a `markNeedsLayout()`
+      // (see post-frame callback below) → layout pass → potential async
+      // `makeRenderTexture` round-trip → visible flicker. See
+      // https://github.com/rive-app/rive-flutter/issues/582.
+      final col0 = currentTransformTo.getColumn(0);
+      final col1 = currentTransformTo.getColumn(1);
+      final newWidthScale =
+          math.sqrt(col0.x * col0.x + col0.y * col0.y + col0.z * col0.z);
+      final newHeightScale =
+          math.sqrt(col1.x * col1.x + col1.y * col1.y + col1.z * col1.z);
+
+      // Relative-epsilon comparison so tiny floating-point drift from
+      // compositor matrix multiplications doesn't keep the loop alive.
+      // 0.5% is well below what a user would perceive as a quality change
+      // but coarse enough to swallow numerical noise.
+      const double kScaleEpsilon = 0.005;
+      final widthChanged = (newWidthScale - desiredTransformWidthScale).abs() >
+          kScaleEpsilon * desiredTransformWidthScale;
+      final heightChanged =
+          (newHeightScale - desiredTransformHeightScale).abs() >
+              kScaleEpsilon * desiredTransformHeightScale;
+
+      if (widthChanged || heightChanged) {
         SchedulerBinding.instance.addPostFrameCallback((_) {
           markNeedsLayout();
         });
