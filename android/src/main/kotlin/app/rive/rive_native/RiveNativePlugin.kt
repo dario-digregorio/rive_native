@@ -17,6 +17,12 @@ external fun createRiveRenderer(
 
 external fun destroyRiveRenderer(renderer: Long)
 external fun markDestroyedRiveRenderer(renderer: Long)
+external fun resizeRiveRenderer(
+    renderer: Long,
+    surface: Surface,
+    width: Int,
+    height: Int,
+): Boolean
 
 class RiveNativePlugin :
     FlutterPlugin,
@@ -81,6 +87,44 @@ class RiveNativePlugin :
                         "rendererContext" to "android",
                     ),
                 )
+            }
+
+            "resizeTexture" -> {
+                val textureId = call.argument<Int>("id")?.toLong()
+                val width = call.argument<Int>("width")
+                val height = call.argument<Int>("height")
+                if (textureId == null || width == null || height == null) {
+                    result.error(
+                        "resizeTexture Error",
+                        "id, width and height are required",
+                        null,
+                    )
+                    return
+                }
+
+                val texture = renderTextures[textureId]
+                if (texture == null) {
+                    Log.w(
+                        "RiveNativePlugin",
+                        "resizeTexture: texture $textureId not found",
+                    )
+                    result.error(
+                        "resizeTexture Error",
+                        "Texture not found",
+                        null,
+                    )
+                    return
+                }
+
+                if (texture.resize(width, height)) {
+                    result.success(null)
+                } else {
+                    result.error(
+                        "resizeTexture Error",
+                        "Native resize failed",
+                        null,
+                    )
+                }
             }
 
             "removeTexture" -> {
@@ -149,6 +193,22 @@ class RiveRenderTexture(
     override fun onSurfaceCleanup() {
         // Do surface cleanup here, and stop drawing frames.
         markRendererDestroyed()
+    }
+
+    // Resize the producer's surface in place and forward the new size to
+    // native so the existing renderer (and shared GL context) is reused
+    // instead of being destroyed and rebuilt. The native side drops only the
+    // EGL surface + Rive render target; the next frame lazily recreates them
+    // at the new dimensions in beginFrame().
+    fun resize(width: Int, height: Int): Boolean {
+        synchronized(this) {
+            if (riveRenderer == 0L) {
+                return false
+            }
+            producer.setSize(width, height)
+            surface = producer.surface
+            return resizeRiveRenderer(riveRenderer, surface, width, height)
+        }
     }
 
     private fun markRendererDestroyed() {

@@ -93,6 +93,13 @@ base class _NativeRenderTexture extends RenderTexture {
   /// clears it eagerly so a concurrent layout doesn't double-fire.
   bool _needsRecreate = false;
 
+  /// Latched to `true` after the platform replies `MissingPluginException`
+  /// to `resizeTexture`. Currently only the Android plugin implements that
+  /// method (it resizes the existing SurfaceProducer + EGL surface in place
+  /// instead of going through a full `createTexture` round-trip). On every
+  /// other platform we ask once, get told no, and never ask again.
+  bool _resizeUnsupported = false;
+
   _NativeRenderTexture(this.methodChannel);
 
   @override
@@ -157,6 +164,35 @@ base class _NativeRenderTexture extends RenderTexture {
     // flight. The caller already guards with `_isCreatingTexture`, but
     // resetting here is cheap insurance.
     _needsRecreate = false;
+
+    // Fast path: pure size change on a platform that supports in-place
+    // resize (currently Android only). Keeps the existing renderer pointer,
+    // SurfaceProducer and shared GL context alive, so layout-driven resize
+    // ticks don't tear down and rebuild the whole pipeline every frame.
+    // `_textureId != -1 && _rendererPtr != nullptr` means we have a live
+    // texture to resize — not a fresh create after dispose or backgrounding.
+    if (_textureId != -1 &&
+        _rendererPtr != nullptr &&
+        !_resizeUnsupported) {
+      try {
+        await methodChannel.invokeMethod('resizeTexture', {
+          'id': _textureId,
+          'width': width == 0 ? 1 : width,
+          'height': height == 0 ? 1 : height,
+        });
+        _actualWidth = width;
+        _actualHeight = height;
+        return;
+      } on MissingPluginException {
+        // Platform plugin doesn't implement resizeTexture (iOS / macOS /
+        // Linux / Windows). Latch and fall through to the full recreate.
+        _resizeUnsupported = true;
+      } on PlatformException {
+        // Native resize failed (e.g. null surface). Fall through to the
+        // full createTexture path, which will rebuild from scratch.
+      }
+    }
+
     final result = await methodChannel.invokeMethod('createTexture', {
       'width': width == 0 ? 1 : width,
       'height': height == 0 ? 1 : height,

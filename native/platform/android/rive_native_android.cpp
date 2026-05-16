@@ -443,6 +443,62 @@ public:
         return true;
     }
 
+    // Resize the texture in place without destroying the renderContext or the
+    // PLS renderer. Used by the Kotlin layer when the producer's underlying
+    // SurfaceTexture has been resized via SurfaceProducer.setSize() — far
+    // cheaper than tearing down and recreating the whole AndroidRenderTexture
+    // on every resize tick. Caller is responsible for holding flutterMutex.
+    bool resize(JNIEnv* env,
+                jobject surface,
+                uint32_t width,
+                uint32_t height)
+    {
+        if (m_scheduledDestruction)
+        {
+            LOGW("Rive AndroidRenderTexture resize called on destroyed "
+                 "texture");
+            return false;
+        }
+        if (surface == nullptr)
+        {
+            LOGE("Rive AndroidRenderTexture resize called with null surface");
+            return false;
+        }
+
+        // Tear down GPU resources tied to the old ANativeWindow / dimensions.
+        // The render target has the old size baked in, and the EGL surface is
+        // bound to the old native window. The shared renderContext and the
+        // PLS renderer stay alive.
+        if (threadState && m_eglSurface != EGL_NO_SURFACE)
+        {
+            threadState->destroySurface(m_eglSurface);
+            m_eglSurface = EGL_NO_SURFACE;
+        }
+        m_renderTarget = nullptr;
+
+        // Swap the native window. ANativeWindow_fromSurface returns with a
+        // +1 reference which the destructor's ANativeWindow_release balances.
+        if (m_surfaceWindow)
+        {
+            ANativeWindow_release(m_surfaceWindow);
+            m_surfaceWindow = nullptr;
+        }
+        ANativeWindow* newWindow = ANativeWindow_fromSurface(env, surface);
+        if (!newWindow)
+        {
+            LOGE("Rive AndroidRenderTexture resize: "
+                 "ANativeWindow_fromSurface returned null");
+            m_width = width;
+            m_height = height;
+            return false;
+        }
+        m_surfaceWindow = newWindow;
+
+        m_width = width;
+        m_height = height;
+        return true;
+    }
+
     void scheduleDestruction() { m_scheduledDestruction = true; }
 
 private:
@@ -526,6 +582,30 @@ Java_app_rive_rive_1native_RiveNativePluginKt_markDestroyedRiveRenderer(
     {
         LOGW("JNI: Rive markDestroyedRiveRenderer called with null pointer");
     }
+}
+
+EXPORT jboolean
+Java_app_rive_rive_1native_RiveNativePluginKt_resizeRiveRenderer(
+    JNIEnv* env,
+    jclass clazz,
+    jlong renderer,
+    jobject surface,
+    jint width,
+    jint height)
+{
+    std::unique_lock<std::mutex> lock(flutterMutex);
+    if (renderer == 0 || surface == nullptr)
+    {
+        LOGW("JNI: Rive resizeRiveRenderer called with null renderer or "
+             "surface");
+        return JNI_FALSE;
+    }
+    AndroidRenderTexture* renderTexture =
+        reinterpret_cast<AndroidRenderTexture*>(renderer);
+    return renderTexture
+                   ->resize(env, surface, (uint32_t)width, (uint32_t)height)
+               ? JNI_TRUE
+               : JNI_FALSE;
 }
 
 EXPORT bool clear(AndroidRenderTexture* renderTexture,
