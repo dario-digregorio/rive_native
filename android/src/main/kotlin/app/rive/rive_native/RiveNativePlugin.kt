@@ -37,6 +37,16 @@ class RiveNativePlugin :
     private lateinit var textureRegistry: TextureRegistry
     private val renderTextures = mutableMapOf<Long, RiveRenderTexture>()
 
+    // Flipped to false on first UnsatisfiedLinkError from resizeRiveRenderer.
+    // This happens when the bundled native library predates the
+    // resizeRiveRenderer JNI symbol (e.g. the prebuilt .so downloaded by
+    // `dart run rive_native:setup` from the pub.dev release). Once latched,
+    // every subsequent resizeTexture call responds with `notImplemented`,
+    // so the Dart side latches `_resizeUnsupported = true` (via
+    // MissingPluginException) and stops asking — gracefully falling back
+    // to the full `createTexture` recreate path.
+    private var nativeResizeSupported = true
+
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
         channel = MethodChannel(flutterPluginBinding.binaryMessenger, "rive_native")
         channel.setMethodCallHandler(this)
@@ -90,6 +100,11 @@ class RiveNativePlugin :
             }
 
             "resizeTexture" -> {
+                if (!nativeResizeSupported) {
+                    result.notImplemented()
+                    return
+                }
+
                 val textureId = call.argument<Int>("id")?.toLong()
                 val width = call.argument<Int>("width")
                 val height = call.argument<Int>("height")
@@ -116,7 +131,25 @@ class RiveNativePlugin :
                     return
                 }
 
-                if (texture.resize(width, height)) {
+                val resized: Boolean = try {
+                    texture.resize(width, height)
+                } catch (e: UnsatisfiedLinkError) {
+                    nativeResizeSupported = false
+                    Log.w(
+                        "RiveNativePlugin",
+                        "resizeRiveRenderer JNI symbol missing from " +
+                            "librive_native.so — the bundled prebuilt " +
+                            "predates this fork's Android in-place resize " +
+                            "support. Falling back to texture recreation. " +
+                            "Rebuild the native lib with " +
+                            "`dart run rive_native:setup --build -p android` " +
+                            "(or `make android` in the rive_native repo) to " +
+                            "enable in-place resize.",
+                    )
+                    result.notImplemented()
+                    return
+                }
+                if (resized) {
                     result.success(null)
                 } else {
                     result.error(
